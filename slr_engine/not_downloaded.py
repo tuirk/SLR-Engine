@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .oa_resolver import extract_arxiv_id
+from .oa_resolver import ALLOWED_OA_TIERS, extract_arxiv_id
 
 REPORT_FIELDS = [
     "canonical_id",
@@ -16,6 +16,7 @@ REPORT_FIELDS = [
     "pmid",
     "pmcid",
     "url",
+    "oa_url",
     "download_status",
     "resolver_source",
     "error",
@@ -29,9 +30,14 @@ def suggested_action(
     url: Optional[str],
     source: Optional[str] = None,
     source_id: Optional[str] = None,
+    oa_status: Optional[str] = None,
 ) -> str:
     if extract_arxiv_id(source=source, source_id=source_id, record_url=url, doi=doi):
         return "check_preprint"
+    if (oa_status or "").lower() in ALLOWED_OA_TIERS:
+        # Open access, but the script could not fetch it (bot challenge,
+        # landing page only): a browser usually can.
+        return "open_access_manual"
     if doi:
         return "ILL"
     if url:
@@ -44,7 +50,7 @@ def fetch_not_downloaded(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
         SELECT r.id, r.canonical_id, r.title, r.year, r.doi, r.pmid, r.pmcid,
-               r.url,
+               r.url, r.oa_status, r.oa_url,
                (SELECT sh.source FROM source_hits sh
                  WHERE sh.record_id = r.id AND sh.source = 'arxiv'
                  LIMIT 1) AS source,
@@ -91,6 +97,7 @@ def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict]:
             "pmid": r["pmid"],
             "pmcid": r["pmcid"],
             "url": r["url"],
+            "oa_url": (r["oa_url"] if "oa_url" in keys else None) or "",
             "download_status": r["download_status"] or "none",
             "resolver_source": r["resolver_source"] or "",
             "error": r["error"] or "",
@@ -99,6 +106,7 @@ def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict]:
                 url=r["url"],
                 source=r["source"] if "source" in keys else None,
                 source_id=r["source_id"] if "source_id" in keys else None,
+                oa_status=r["oa_status"] if "oa_status" in keys else None,
             ),
         })
     return out
@@ -117,8 +125,8 @@ def write_not_downloaded_report(screening_dir: Path, rows: list[dict]) -> tuple[
             writer.writerow(row)
 
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("# Records included at title/abstract but no OA full text.\n")
-        f.write("# Use ILL, author request, or a preprint check to obtain these.\n")
+        f.write("# Records included at title/abstract without a downloaded full text.\n")
+        f.write("# Use the open-access link, ILL, an author request, or a preprint check.\n")
         f.write(f"# Count: {len(rows)}\n\n")
         for row in rows:
             year = row.get("year") or "?"
@@ -132,6 +140,8 @@ def write_not_downloaded_report(screening_dir: Path, rows: list[dict]) -> tuple[
                 f.write(f"  PMCID: {row['pmcid']}\n")
             if row.get("url"):
                 f.write(f"  URL: {row['url']}\n")
+            if row.get("oa_url"):
+                f.write(f"  Open-access copy: {row['oa_url']}\n")
             status = row.get("download_status") or "none"
             src = row.get("resolver_source") or "-"
             f.write(f"  Status: {status} (via {src})\n")

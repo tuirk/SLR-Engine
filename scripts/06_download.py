@@ -4,10 +4,15 @@
 Walks status='resolved' then status='queued' candidates per record until one
 download succeeds. Leftover queued rows become skipped_superseded.
 
+A response only counts as a success when its bytes are a usable full text:
+bot/JavaScript challenge pages, empty app shells and metadata-only XML are
+recorded as failures so the next candidate is tried.
+
 Usage:
   python scripts/06_download.py --project <id>
   python scripts/06_download.py --project <id> --max 50
   python scripts/06_download.py --project <id> --retry-failed
+  python scripts/06_download.py --project <id> --revalidate
 """
 import argparse
 import sys
@@ -17,7 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from slr_engine.store import ProjectPaths, connect, log_event
-from slr_engine.oa_resolver import ALLOWED_OA_TIERS
+from slr_engine.oa_resolver import ALLOWED_OA_TIERS, LANDING_SOURCES, direct_download_url
+from slr_engine.fulltext_validation import EXTENSIONS, check_fulltext
 from slr_engine.not_downloaded import (
     fetch_not_downloaded,
     rows_to_dicts,
@@ -29,14 +35,88 @@ USER_AGENT = "slr-engine/1.0 (research; OA only)"
 
 
 def _safe_filename(canonical_id: str, fmt: str) -> str:
-    ext = {"pdf": "pdf", "xml": "xml", "html": "html"}.get(fmt, "bin")
-    return f"{canonical_id}.{ext}"
+    return f"{canonical_id}.{EXTENSIONS.get(fmt, 'bin')}"
 
 
-def _looks_like_pdf(data: bytes, file_format: str | None) -> bool:
-    if (file_format or "").lower() != "pdf":
-        return True
-    return data[:5] == b"%PDF-" or data[:4] == b"%PDF"
+# Landing pages are candidates so an open-access work keeps its status and its
+# link in not_downloaded.csv, but they are not fetched: publisher and
+# repository pages (menus, abstract, citation widgets) cannot be told apart
+# from an HTML article reliably, and most refuse scripts anyway.
+LANDING_REASON = "open-access landing page, no direct file link: open it in a browser"
+
+
+def _requeue_superseded(conn, record_id: int) -> None:
+    """Put candidates that an earlier success had superseded back in line."""
+    conn.execute(
+        "UPDATE downloads SET status='queued', error=NULL "
+        "WHERE record_id=? AND status='skipped_superseded'",
+        (record_id,),
+    )
+    if conn.execute(
+        "SELECT 1 FROM downloads WHERE record_id=? AND status='resolved'",
+        (record_id,),
+    ).fetchone():
+        return
+    first = conn.execute(
+        "SELECT id FROM downloads WHERE record_id=? AND status='queued' "
+        "ORDER BY id LIMIT 1",
+        (record_id,),
+    ).fetchone()
+    if first:
+        conn.execute(
+            "UPDATE downloads SET status='resolved' WHERE id=?", (first["id"],)
+        )
+
+
+def _revalidate(paths: ProjectPaths) -> None:
+    """Re-check files already marked success; demote the ones that are not full text."""
+    to_delete: list[Path] = []
+    missing = 0
+    with connect(paths.db) as conn:
+        rows = conn.execute(
+            """
+            SELECT d.id AS dl_id, d.record_id, d.file_path, d.file_format,
+                   d.resolver_source, r.canonical_id
+            FROM downloads d JOIN records r ON r.id = d.record_id
+            WHERE d.status = 'success'
+            ORDER BY d.record_id
+            """
+        ).fetchall()
+        for row in rows:
+            path = paths.root / row["file_path"] if row["file_path"] else None
+            if path is None or not path.is_file():
+                # The URL worked before; fetch it again rather than failing it.
+                missing += 1
+                conn.execute(
+                    "UPDATE downloads SET status='queued', file_path=NULL, "
+                    "error='file missing on disk; re-queued' WHERE id=?",
+                    (row["dl_id"],),
+                )
+                _requeue_superseded(conn, row["record_id"])
+                print(f"  MISSING {row['canonical_id']}: re-queued")
+                continue
+            if row["resolver_source"] in LANDING_SOURCES:
+                reason = LANDING_REASON
+            else:
+                reason = check_fulltext(path.read_bytes(), row["file_format"]).reason
+            if reason is None:
+                continue
+            to_delete.append(path)
+            conn.execute(
+                "UPDATE downloads SET status='failed', file_path=NULL, error=? "
+                "WHERE id=?",
+                (f"rejected on revalidation: {reason}"[:500], row["dl_id"]),
+            )
+            _requeue_superseded(conn, row["record_id"])
+            log_event(conn, "download", "warn",
+                      f"Rejected on revalidation: {row['canonical_id']}",
+                      {"file_path": row["file_path"], "reason": reason})
+            print(f"  REJECT {path.name}: {reason}")
+    for path in to_delete:
+        path.unlink(missing_ok=True)
+    kept = len(rows) - len(to_delete) - missing
+    print(f"Revalidated {len(rows)} download(s): {kept} kept, "
+          f"{len(to_delete)} rejected, {missing} missing.")
 
 
 def main():
@@ -52,6 +132,13 @@ def main():
         help="Re-queue records that only have failed attempts (promote to resolved)",
     )
     ap.add_argument(
+        "--revalidate",
+        action="store_true",
+        help="Re-check files already marked success; delete ones that are not "
+             "full text (challenge pages, metadata-only XML) and try the "
+             "record's other candidates",
+    )
+    ap.add_argument(
         "--projects-root",
         default=str(Path(__file__).resolve().parents[1] / "projects"),
     )
@@ -60,6 +147,9 @@ def main():
     paths = ProjectPaths(Path(args.projects_root) / args.project)
     paths.fulltext.mkdir(parents=True, exist_ok=True)
     paths.screening.mkdir(parents=True, exist_ok=True)
+
+    if args.revalidate:
+        _revalidate(paths)
 
     with connect(paths.db) as conn:
         if args.retry_failed:
@@ -141,7 +231,7 @@ def main():
             continue
 
         oa_status = (meta["oa_status"] or "unknown").lower()
-        # arXiv/green candidates are always allowed; only skip closed/hybrid records
+        # arXiv/green candidates are always allowed; only skip closed records
         # when there is no candidate that carries an allowed tier via resolve time.
         if oa_status not in ALLOWED_OA_TIERS and oa_status not in ("unknown",):
             with connect(paths.db) as conn:
@@ -161,24 +251,32 @@ def main():
         succeeded = False
         last_err = None
         for c in candidates:
-            fname = _safe_filename(meta["canonical_id"], c["file_format"] or "bin")
-            out_path = paths.fulltext / fname
+            url = direct_download_url(c["url"])
+            if url != c["url"]:
+                # Candidates resolved before the rewrite existed.
+                with connect(paths.db) as conn:
+                    conn.execute("UPDATE downloads SET url=? WHERE id=?",
+                                 (url, c["dl_id"]))
             try:
+                if c["resolver_source"] in LANDING_SOURCES:
+                    raise ValueError(LANDING_REASON)
                 req = urllib.request.Request(
-                    c["url"], headers={"User-Agent": USER_AGENT}
+                    url, headers={"User-Agent": USER_AGENT}
                 )
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     data = resp.read()
-                if not data:
-                    raise ValueError("empty response body")
-                if not _looks_like_pdf(data, c["file_format"]):
-                    raise ValueError("response was not a PDF")
+                check = check_fulltext(data, c["file_format"])
+                if not check.ok:
+                    raise ValueError(check.reason)
+                fname = _safe_filename(meta["canonical_id"], check.detected_format)
+                out_path = paths.fulltext / fname
                 out_path.write_bytes(data)
                 with connect(paths.db) as conn:
                     conn.execute(
                         "UPDATE downloads SET status='success', file_path=?, "
-                        "error=NULL WHERE id=?",
-                        (str(out_path.relative_to(paths.root)), c["dl_id"]),
+                        "file_format=?, error=NULL WHERE id=?",
+                        (str(out_path.relative_to(paths.root)),
+                         check.detected_format, c["dl_id"]),
                     )
                     # Cancel leftover candidates for this record
                     conn.execute(
@@ -205,7 +303,7 @@ def main():
                     )
                     log_event(conn, "download", "warn",
                               f"Failed: {meta['canonical_id']}",
-                              {"url": c["url"], "resolver_source": c["resolver_source"],
+                              {"url": url, "resolver_source": c["resolver_source"],
                                "error": str(e)})
                 print(
                     f"  FAIL {meta['canonical_id']} via {c['resolver_source']}: {e}"

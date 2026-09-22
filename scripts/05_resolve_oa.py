@@ -20,11 +20,12 @@ Usage:
 import argparse
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from slr_engine.env import load_dotenv, openalex_api_key
-from slr_engine.store import ProjectConfig, ProjectPaths, connect
+from slr_engine.store import ProjectConfig, ProjectPaths, connect, log_event
 from slr_engine.oa_resolver import resolve_candidates, ALLOWED_OA_TIERS
 
 
@@ -121,12 +122,15 @@ def main():
     resolved = 0
     queued_total = 0
     skipped = 0
+    lookup_failed = 0
+    failed_sources: Counter = Counter()
     oa_key = openalex_api_key(cfg)
     core_key = None
     if cfg.sources.get("core") is True:
         core_key = args.core_api_key or os.environ.get("CORE_API_KEY")
 
     for r in rows:
+        errors: list[str] = []
         candidates = resolve_candidates(
             doi=r["doi"], pmid=r["pmid"], pmcid=r["pmcid"],
             openalex_id=r["openalex_id"],
@@ -136,6 +140,7 @@ def main():
             record_url=r["url"],
             source="arxiv" if r["arxiv_source_id"] else None,
             source_id=r["arxiv_source_id"],
+            errors=errors,
         )
         # Keep only allowed OA tiers
         candidates = [
@@ -143,7 +148,27 @@ def main():
             if (c.get("oa_status") or "unknown") in ALLOWED_OA_TIERS
         ]
 
+        failed_sources.update({e.split(":", 1)[0] for e in errors})
         with connect(paths.db) as conn:
+            if not candidates and errors:
+                # "No open copy" is unproven while a lookup failed; leave the
+                # record without download rows so the next run retries it.
+                lookup_failed += 1
+                log_event(conn, "resolve", "warn",
+                          f"OA lookup failed: {r['canonical_id']}",
+                          {"errors": errors[:5]})
+                print(f"  LOOKUP FAILED {r['canonical_id']}: {errors[0]}")
+                continue
+            if errors:
+                log_event(conn, "resolve", "warn",
+                          f"OA lookup incomplete: {r['canonical_id']}",
+                          {"errors": errors[:5]})
+
+            # A record re-resolved after an earlier run found nothing.
+            conn.execute(
+                "DELETE FROM downloads WHERE record_id=? AND status='skipped_closed'",
+                (r["id"],),
+            )
             if not candidates:
                 conn.execute(
                     "INSERT INTO downloads "
@@ -186,6 +211,13 @@ def main():
     print(f"Resolved: {resolved}")
     print(f"Queued alternates: {queued_total}")
     print(f"Skipped (no OA found): {skipped}")
+    if failed_sources:
+        per_source = ", ".join(f"{s} for {n} record(s)" for s, n in failed_sources.most_common())
+        print(f"Lookup errors: {per_source}. Records resolved without those sources may")
+        print("  be missing a copy; after downloading, re-run this script and 06 to retry.")
+    if lookup_failed:
+        print(f"Lookups failed: {lookup_failed} record(s) left unresolved; "
+              f"re-run this script to retry them.")
     print()
     print("Next: python scripts/06_download.py --project", args.project)
 
