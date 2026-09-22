@@ -70,8 +70,7 @@ class PubMedAdapter(SourceAdapter):
         url = f"{self.base}/esearch.fcgi?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
+            data = json.loads(self._fetch(req))
         except Exception as e:
             self._record_error(
                 f"pubmed esearch failed: {type(e).__name__}: {e} "
@@ -96,8 +95,7 @@ class PubMedAdapter(SourceAdapter):
         url = f"{self.base}/efetch.fcgi?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                xml_data = resp.read()
+            xml_data = self._fetch(req, timeout=60)
         except Exception as e:
             self._record_error(
                 f"pubmed efetch failed: {type(e).__name__}: {e} "

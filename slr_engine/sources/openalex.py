@@ -17,6 +17,15 @@ from . import SourceAdapter, NormalizedRecord
 # queries must be split into chunks and merged client-side.
 _MAX_QUERY_CHARS = 3800
 
+# OpenAlex's `search=` has no minimum-score floor: it returns every work with
+# ANY term overlap, ranked by `relevance_score`, all the way down to noise.
+# Empirically (vibe-coding-research-2026, 2026-08-06): top score ~211, and
+# results stayed genuinely on-topic down to ratio ~0.05-0.07 (rank ~100-110);
+# below that the tail drifted into unrelated fields fast. Default cutoff is
+# deliberately a bit below that observed break so it doesn't clip borderline
+# hits, while still stopping well before the score decays into irrelevance.
+_DEFAULT_MIN_RELEVANCE_RATIO = 0.03
+
 
 def _reconstruct_abstract(inverted: Optional[dict]) -> Optional[str]:
     """OpenAlex returns abstracts as inverted indices for licensing reasons."""
@@ -30,27 +39,87 @@ def _reconstruct_abstract(inverted: Optional[dict]) -> Optional[str]:
     return " ".join(w for _, w in positions) or None
 
 
+def _split_top_level(s: str, op: str) -> list[str]:
+    """Split ``s`` at `` op `` occurrences outside parentheses and quotes."""
+    parts: list[str] = []
+    depth = 0
+    in_quote = False
+    last = 0
+    token = f" {op} "
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == '"':
+            in_quote = not in_quote
+        elif not in_quote and c == "(":
+            depth += 1
+        elif not in_quote and c == ")":
+            depth -= 1
+        elif not in_quote and depth == 0 and s.startswith(token, i):
+            parts.append(s[last:i].strip())
+            i += len(token)
+            last = i
+            continue
+        i += 1
+    parts.append(s[last:].strip())
+    return [p for p in parts if p]
+
+
+def _unwrap(group: str) -> str:
+    """Drop one pair of parentheses enclosing the whole group, if present."""
+    if not (group.startswith("(") and group.endswith(")")):
+        return group
+    depth = 0
+    for i, c in enumerate(group):
+        depth += c == "("
+        depth -= c == ")"
+        if depth == 0 and i < len(group) - 1:
+            return group          # "(a) OR (b)": the first paren closes early
+    return group[1:-1].strip()
+
+
 def _split_query(query: str, max_chars: int = _MAX_QUERY_CHARS) -> list[str]:
-    """Split a long Boolean query into chunks that fit OpenAlex URL limits."""
+    """Split a Boolean query too long for one request into queries whose
+    results, merged, match the original.
+
+    For (A1 OR A2 ...) AND (B1 OR ...) AND ..., the terms of the largest
+    OR-group are spread across copies of the query that keep every other
+    group intact: (A1 OR A2) AND B, (A3 OR A4) AND B, ... Splitting at
+    arbitrary spaces instead would break the parentheses and drop concept
+    groups from later chunks. A query without that shape is sent whole.
+    """
     q = query.strip()
     if len(q) <= max_chars:
         return [q]
+    q = " ".join(q.split())
 
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-    for part in q.replace("\n", " ").split():
-        add_len = len(part) + (1 if current else 0)
-        if current and current_len + add_len > max_chars:
-            chunks.append(" ".join(current))
-            current = [part]
-            current_len = len(part)
-        else:
-            current.append(part)
-            current_len += add_len
-    if current:
-        chunks.append(" ".join(current))
-    return chunks or [q]
+    groups = _split_top_level(q, "AND")
+    candidates = [
+        i for i, g in enumerate(groups)
+        if not g.upper().startswith("NOT ")
+        and len(_split_top_level(_unwrap(g), "OR")) > 1
+    ]
+    if not candidates:
+        return [q]
+    idx = max(candidates, key=lambda i: len(groups[i]))
+    terms = _split_top_level(_unwrap(groups[idx]), "OR")
+    rest = len(q) - len(groups[idx])
+    budget = max_chars - rest - 2          # the chunk's own parentheses
+
+    chunks: list[list[str]] = [[]]
+    for term in terms:
+        if chunks[-1] and len(" OR ".join(chunks[-1] + [term])) > budget:
+            chunks.append([])
+        chunks[-1].append(term)
+    if budget <= 0 or any(len(" OR ".join(c)) > budget for c in chunks):
+        return [q]
+
+    out = []
+    for chunk in chunks:
+        parts = list(groups)
+        parts[idx] = "(" + " OR ".join(chunk) + ")"
+        out.append(" AND ".join(parts))
+    return out
 
 
 class OpenAlexAdapter(SourceAdapter):
@@ -63,10 +132,12 @@ class OpenAlexAdapter(SourceAdapter):
         api_key: Optional[str] = None,
         require_abstract: bool = True,
         user_agent: str = "slr-engine/1.0 (research; OA only)",
+        min_relevance_ratio: float = _DEFAULT_MIN_RELEVANCE_RATIO,
     ):
         super().__init__(contact_email=contact_email, user_agent=user_agent)
         self.api_key = api_key
         self.require_abstract = require_abstract
+        self.min_relevance_ratio = min_relevance_ratio
 
     def search(
         self,
@@ -124,6 +195,7 @@ class OpenAlexAdapter(SourceAdapter):
         params = {k: v for k, v in params.items() if v is not None}
 
         fetched = 0
+        top_score: Optional[float] = None
         while True:
             url = f"{self.base}?{urllib.parse.urlencode(params)}"
             headers = {"User-Agent": self.user_agent}
@@ -131,8 +203,7 @@ class OpenAlexAdapter(SourceAdapter):
                 headers["Authorization"] = f"Bearer {self.api_key}"
             req = urllib.request.Request(url, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read())
+                data = json.loads(self._fetch(req))
             except Exception as e:
                 self._record_error(
                     f"openalex request failed: {type(e).__name__}: {e} "
@@ -141,6 +212,14 @@ class OpenAlexAdapter(SourceAdapter):
                 return
 
             for work in data.get("results", []):
+                score = work.get("relevance_score")
+                if score is not None:
+                    if top_score is None:
+                        top_score = score
+                    elif top_score > 0 and score < top_score * self.min_relevance_ratio:
+                        # Scores are sorted descending; once we're below the
+                        # floor, every remaining result in this run is worse.
+                        return
                 yield self._to_record(work)
                 fetched += 1
                 if fetched >= max_records:
@@ -198,5 +277,6 @@ class OpenAlexAdapter(SourceAdapter):
             language=w.get("language"),
             keywords=keywords or None,
             url=w.get("doi") or (loc.get("landing_page_url")),
+            native_relevance_score=w.get("relevance_score"),
             raw=w,
         )

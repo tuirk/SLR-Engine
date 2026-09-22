@@ -11,9 +11,31 @@ This keeps adapters testable in isolation.
 from __future__ import annotations
 
 import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional, TypeVar
+
+T = TypeVar("T")
+
+# Rate limiting and transient server trouble; anything else fails at once.
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# A server asking for a longer pause than this is reporting an exhausted
+# quota rather than a burst limit, so waiting it out would only stall the run.
+MAX_RETRY_WAIT = 60.0
+
+
+def _http_status(exc: Exception) -> tuple[Optional[int], Optional[str]]:
+    """(status code, Retry-After header) for urllib and requests HTTP errors."""
+    if isinstance(exc, urllib.error.HTTPError):
+        headers = exc.headers or {}
+        return exc.code, headers.get("Retry-After")
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        return status, (response.headers or {}).get("Retry-After")
+    return None, None
 
 
 @dataclass
@@ -35,6 +57,7 @@ class NormalizedRecord:
     url: Optional[str] = None
     tldr: Optional[str] = None
     snowball_rank: Optional[int] = None
+    native_relevance_score: Optional[float] = None
     raw: Optional[dict] = None
 
 
@@ -65,6 +88,46 @@ class SourceAdapter(ABC):
 
     def _polite_sleep(self, seconds: float = 0.1) -> None:
         time.sleep(seconds)
+
+    def _with_retry(self, fetch: Callable[[], T], max_retries: int = 4) -> T:
+        """Call ``fetch``, retrying rate limits and transient failures.
+
+        Waits for Retry-After when the server sends one, otherwise 2, 4, 8,
+        16... seconds. Client errors other than 429, and anything that is not
+        an HTTP or network error, are raised on the first attempt.
+        """
+        attempt = 0
+        while True:
+            try:
+                return fetch()
+            except Exception as exc:
+                status, retry_after = _http_status(exc)
+                if status is not None:
+                    transient = status in RETRY_STATUSES
+                else:
+                    # URLError, timeouts, connection resets (requests' network
+                    # errors are OSErrors too).
+                    transient = isinstance(exc, OSError)
+                if not transient or attempt >= max_retries:
+                    raise
+                wait = 2.0 ** (attempt + 1)
+                if retry_after:
+                    try:
+                        wait = float(retry_after)
+                    except ValueError:
+                        pass
+                if wait > MAX_RETRY_WAIT:
+                    raise
+                attempt += 1
+                self._polite_sleep(wait)
+
+    def _fetch(self, req: urllib.request.Request, timeout: float = 30,
+               max_retries: int = 4) -> bytes:
+        """GET ``req`` and return the body, retrying transient failures."""
+        def once() -> bytes:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        return self._with_retry(once, max_retries=max_retries)
 
     def _record_error(self, msg: str) -> None:
         """Adapters call this when an HTTP request fails. The orchestrator

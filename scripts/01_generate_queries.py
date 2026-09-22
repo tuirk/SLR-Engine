@@ -110,17 +110,17 @@ ARXIV_TEMPLATE = """\
 """
 
 SEMANTIC_SCHOLAR_TEMPLATE = """\
-# Semantic Scholar search string.
+# Semantic Scholar search string (/paper/search).
 #
-# S2 supports free-text query with quoted phrases. It is less rich than
-# OpenAlex Boolean syntax, but accepts operator-style grouping in practice.
+# Plain text only. S2 relevance search has no query syntax: AND/OR/NOT are
+# matched as ordinary words, quotes and parentheses are ignored, and
+# hyphenated terms match nothing (write "vibe coding", not "vibe-coding").
+# The query validator blocks Boolean operators and hyphenated terms.
 #
-# Example shape:
-#   ("<concept A term 1>" OR "<concept A term 2>")
-#   AND ("<concept B term 1>" OR "<concept B term 2>")
-#   AND (empirical OR experiment*)
+# Use a few distinctive words for the review's core concept, e.g.:
+#   <core term> <second distinctive term>
 
-<replace with query string>
+<replace with plain-text query>
 """
 
 DBLP_TEMPLATE = """\

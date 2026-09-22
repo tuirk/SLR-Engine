@@ -17,6 +17,7 @@ Usage:
   python scripts/03_dedup.py --project <id> --force
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -26,23 +27,55 @@ from slr_engine.dedup import fuzzy_dedup
 
 
 def _last_search_blocking(conn) -> list[dict]:
-    """Look for the most recent search-stage error events that signal
-    blocking sanity issues. Returns the events found (empty if clean)."""
-    rows = conn.execute(
-        "SELECT message, payload_json FROM events "
-        "WHERE stage = 'search' AND level = 'error' "
-        "ORDER BY id DESC LIMIT 20"
-    ).fetchall()
+    """Blocking search problems that are still current.
+
+    Only each source's most recent query counts, so a source that failed and
+    was then searched again successfully no longer blocks. A pre-flight
+    validation failure blocks while no search has run since it.
+    """
+    latest: dict = {}
+    for q in conn.execute(
+        "SELECT query_id, source, result_count, notes, executed_at "
+        "FROM queries ORDER BY executed_at, rowid"
+    ).fetchall():
+        latest[q["source"]] = q
+
+    errored_queries = set()
+    for e in conn.execute(
+        "SELECT payload_json FROM events WHERE stage = 'search' AND level = 'error'"
+    ).fetchall():
+        try:
+            query_id = json.loads(e["payload_json"] or "{}").get("query_id")
+        except ValueError:
+            continue
+        if query_id:
+            errored_queries.add(query_id)
+
     blocking = []
-    for r in rows:
-        msg = r["message"] or ""
-        if ("Pre-flight query validation failed" in msg
-                or "sanity check found blocking" in msg
-                or "AFTER" in msg and "request error" in msg):
+    for source, q in latest.items():
+        if q["result_count"]:
+            continue
+        if q["notes"] or q["query_id"] in errored_queries:
             blocking.append({
-                "message": msg,
-                "payload": r["payload_json"],
+                "message": f"{source}: latest search returned 0 records after "
+                           "request errors (not a real null result)",
+                "payload": q["notes"],
             })
+        elif source == "openalex":
+            blocking.append({
+                "message": "openalex: latest search returned 0 records; the "
+                           "query is likely malformed or far too narrow",
+                "payload": None,
+            })
+
+    last_run = max((q["executed_at"] for q in latest.values()), default=None)
+    for e in conn.execute(
+        "SELECT message, payload_json, occurred_at FROM events "
+        "WHERE stage = 'search' AND level = 'error' "
+        "AND message LIKE 'Pre-flight query validation failed%' ORDER BY id"
+    ).fetchall():
+        if last_run is None or e["occurred_at"] > last_run:
+            blocking.append({"message": e["message"], "payload": e["payload_json"]})
     return blocking
 
 

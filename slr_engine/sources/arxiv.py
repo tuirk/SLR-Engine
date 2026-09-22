@@ -20,6 +20,13 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Iterator, Optional
 
+try:
+    # export.arxiv.org rejects urllib's TLS handshake with HTTP 406 (seen
+    # September 2026); requests gets through, so prefer it when installed.
+    import requests
+except ImportError:  # pragma: no cover - requests ships with markitdown
+    requests = None
+
 from . import SourceAdapter, NormalizedRecord
 
 
@@ -31,7 +38,17 @@ NS = {
 
 class ArxivAdapter(SourceAdapter):
     name = "arxiv"
-    base = "http://export.arxiv.org/api/query"
+    base = "https://export.arxiv.org/api/query"
+
+    def _get(self, params: dict) -> bytes:
+        headers = {"User-Agent": self.user_agent}
+        if requests is not None:
+            resp = requests.get(self.base, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.content
+        url = f"{self.base}?{urllib.parse.urlencode(params)}"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+            return resp.read()
 
     def search(
         self,
@@ -66,10 +83,8 @@ class ArxivAdapter(SourceAdapter):
                 "sortOrder": "descending",
             }
             url = f"{self.base}?{urllib.parse.urlencode(params)}"
-            req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    body = resp.read()
+                body = self._with_retry(lambda: self._get(params))
             except Exception as e:
                 self._record_error(
                     f"arxiv request failed: {type(e).__name__}: {e} "

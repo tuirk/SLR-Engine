@@ -36,7 +36,7 @@ from slr_engine.env import (
 )
 from slr_engine.store import (
     ProjectConfig, ProjectPaths, connect, insert_source_hit, log_event,
-    record_query
+    record_query, backfill_local_relevance_scores
 )
 from slr_engine.sources import get_adapter
 from slr_engine.query_validator import (
@@ -58,6 +58,17 @@ SOURCE_QUERY_FILE = {
     "dblp":       "dblp.txt",
     "ia_scholar": "ia_scholar.txt",
 }
+
+
+def _failure_note(errors: list[str], n: int, limit: int = 500) -> str:
+    """Note stored with a query whose requests failed, so the methodology
+    report does not present a failed search as a genuine count."""
+    outcome = ("search failed; 0 is not a real null result"
+               if n == 0 else "coverage may be incomplete")
+    first = errors[0]
+    if len(first) > limit:
+        first = first[:limit].rsplit(" ", 1)[0] + " …"
+    return f"{len(errors)} request error(s), {outcome}: {first}"
 
 
 def _read_query(queries_dir: Path, source: str) -> tuple[Any, str]:
@@ -200,7 +211,7 @@ def main():
 
     # ---- Run searches ----
     log_path = paths.logs / "search.log"
-    log_f = open(log_path, "a")
+    log_f = open(log_path, "a", encoding="utf-8")
     log_f.write(f"\n--- search run "
                 f"{dt.datetime.now(dt.timezone.utc).isoformat()} ---\n")
 
@@ -253,15 +264,17 @@ def main():
                         url=rec.url,
                         tldr=rec.tldr,
                         snowball_rank=rec.snowball_rank,
+                        native_relevance_score=rec.native_relevance_score,
                     )
                     n += 1
                     if n % 50 == 0:
                         print(f"  {source}: {n} records...", flush=True)
 
-                record_query(conn, query_id, source, audit_str, None, n)
-
                 # ---- Silent-zero detection (item 6) ----
                 adapter_errors = adapter.errors_during_run
+                note = _failure_note(adapter_errors, n) if adapter_errors else ""
+                record_query(conn, query_id, source, audit_str, None, n, note)
+
                 if n == 0 and adapter_errors:
                     silent_failures.append(source)
                     msg = (
@@ -318,6 +331,22 @@ def main():
         print(f"  {s}: {n}")
     print(f"  total: {sum(counts.values())}")
     print()
+
+    # ---- Local relevance scoring (fills the gap for sources with no
+    # native ranking score, and gives a cross-source-comparable signal) ----
+    with connect(paths.db) as conn:
+        rel_status = backfill_local_relevance_scores(conn, paths)
+        if rel_status["scored"]:
+            print(f"Scored {rel_status['scored']} records via local embedding "
+                  f"relevance (vs. seed papers).")
+            log_event(
+                conn, "search", "info",
+                f"Backfilled local relevance_score for {rel_status['scored']} records",
+                {"scored": rel_status["scored"]}
+            )
+        elif rel_status["skipped_reason"]:
+            print(f"[note] Skipped local relevance scoring: {rel_status['skipped_reason']}")
+        print()
 
     # ---- Post-flight sanity (item 5) ----
     print("Post-search sanity check...")

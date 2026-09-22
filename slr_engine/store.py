@@ -205,11 +205,28 @@ def init_db(db_path: Path) -> None:
         conn.executescript(SCHEMA_SQL)
 
 
+# Columns added after a project's db was first created. CREATE TABLE IF NOT
+# EXISTS in SCHEMA_SQL only covers brand-new databases, so pre-existing
+# project.db files need these backfilled on connect.
+_RECORDS_COLUMN_MIGRATIONS = {
+    "native_relevance_score": "REAL",
+    "relevance_score": "REAL",
+}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+    for col, sql_type in _RECORDS_COLUMN_MIGRATIONS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE records ADD COLUMN {col} {sql_type}")
+
+
 @contextmanager
 def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    _migrate_schema(conn)
     try:
         yield conn
         conn.commit()
@@ -244,6 +261,17 @@ def normalize_doi(doi: Optional[str]) -> Optional[str]:
     return doi or None
 
 
+def normalize_pmcid(pmcid: Optional[str]) -> Optional[str]:
+    """PMC ids as "PMC1234567": OpenAlex and Semantic Scholar give the bare
+    number, PubMed and Europe PMC the prefixed form."""
+    if not pmcid:
+        return None
+    s = str(pmcid).strip().rsplit("/", 1)[-1].upper()
+    if s.startswith("PMC"):
+        s = s[3:]
+    return f"PMC{s}" if s else None
+
+
 # ---------- record insertion ----------
 
 def insert_source_hit(
@@ -269,11 +297,13 @@ def insert_source_hit(
     from_seed: bool = False,
     tldr: Optional[str] = None,
     snowball_rank: Optional[int] = None,
+    native_relevance_score: Optional[float] = None,
 ) -> int:
     """Insert a hit. Either creates a new record or attaches to an existing one
     via DOI/PMID/OpenAlex match. Fuzzy title dedup happens later in 03_dedup.py.
     Returns the record_id."""
     doi = normalize_doi(doi)
+    pmcid = normalize_pmcid(pmcid)
     title_norm = normalize_title(title)
     first_author = (authors[0].get("family") if authors else None) or None
 
@@ -303,12 +333,22 @@ def insert_source_hit(
             "WHEN snowball_rank IS NULL THEN ? "
             "WHEN ? IS NULL THEN snowball_rank "
             "WHEN ? > snowball_rank THEN ? "
-            "ELSE snowball_rank END "
+            "ELSE snowball_rank END, "
+            # A record hit by multiple sources keeps the strongest evidence
+            # of relevance seen so far (native scores aren't cross-source
+            # comparable, but "higher within the same source" is meaningful).
+            "native_relevance_score = CASE "
+            "WHEN native_relevance_score IS NULL THEN ? "
+            "WHEN ? IS NULL THEN native_relevance_score "
+            "WHEN ? > native_relevance_score THEN ? "
+            "ELSE native_relevance_score END "
             "WHERE id = ?",
             (
                 doi, pmid, pmcid, openalex_id, abstract, tldr,
                 1 if from_seed else 0,
                 snowball_rank, snowball_rank, snowball_rank, snowball_rank,
+                native_relevance_score, native_relevance_score,
+                native_relevance_score, native_relevance_score,
                 record_id,
             )
         )
@@ -335,13 +375,15 @@ def insert_source_hit(
                     "INSERT INTO records "
                     "(canonical_id, doi, pmid, pmcid, openalex_id, title, title_norm, "
                     "abstract, authors_json, first_author, year, venue, document_type, "
-                    "language, keywords_json, url, from_seed, tldr, snowball_rank) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "language, keywords_json, url, from_seed, tldr, snowball_rank, "
+                    "native_relevance_score) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (placeholder, doi, pmid, pmcid, openalex_id, title, title_norm,
                      abstract, json.dumps(authors), first_author, year, venue,
                      document_type, language,
                      json.dumps(keywords) if keywords else None, url,
-                     1 if from_seed else 0, tldr, snowball_rank)
+                     1 if from_seed else 0, tldr, snowball_rank,
+                     native_relevance_score)
                 )
                 record_id = cur.lastrowid
                 canonical_id = f"rec_{record_id:06d}"
@@ -389,3 +431,40 @@ def record_query(conn: sqlite3.Connection, query_id: str, source: str,
         (query_id, source, query_string,
          json.dumps(filters) if filters else None, result_count, notes)
     )
+
+
+# ---------- local relevance scoring ----------
+
+def backfill_local_relevance_scores(conn: sqlite3.Connection, paths: "ProjectPaths") -> dict:
+    """Score every record missing `relevance_score` via local sentence
+    embeddings vs. the project's seed papers. See slr_engine/relevance.py.
+
+    Returns a status dict: {"scored": int, "skipped_reason": str|None}.
+    Never raises -- scoring is a best-effort triage aid, not a hard
+    dependency of the pipeline (missing sentence-transformers or missing
+    seeds both degrade to a no-op, not a failure).
+    """
+    from . import relevance as rel
+
+    if not rel.available():
+        return {"scored": 0, "skipped_reason": "sentence-transformers not installed"}
+
+    reference_texts = rel.build_reference_texts(paths)
+    if not reference_texts:
+        return {"scored": 0, "skipped_reason": "no seed text available yet"}
+
+    rows = conn.execute(
+        "SELECT id, title, abstract FROM records WHERE relevance_score IS NULL"
+    ).fetchall()
+    if not rows:
+        return {"scored": 0, "skipped_reason": None}
+
+    scorer = rel.LocalRelevanceScorer(reference_texts)
+    batch = [(r["title"] or "", r["abstract"]) for r in rows]
+    scores = scorer.score_batch(batch)
+
+    conn.executemany(
+        "UPDATE records SET relevance_score = ? WHERE id = ?",
+        [(score, row["id"]) for row, score in zip(rows, scores)],
+    )
+    return {"scored": len(rows), "skipped_reason": None}

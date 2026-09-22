@@ -36,6 +36,18 @@ from . import SourceAdapter, NormalizedRecord
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
+# Crossref's query.bibliographic/query params do NOT support boolean
+# operators or phrase quoting -- verified empirically (2026-08-06): quoted
+# and unquoted versions of the same string returned identical total-results
+# and identical top-5 items. It's a pure bag-of-words relevance search with
+# no minimum-score floor, and it will happily paginate into results that
+# share zero real topical overlap with the query (e.g. "coding" alone
+# matching video-codec and medical-coding papers). The top of the ranking is
+# reliable; the deep tail is not. Empirically the ranking held up well down
+# to score ratio ~0.4-0.45 of the top result, then collapsed into noise by
+# ratio ~0.42 and below.
+_DEFAULT_MIN_RELEVANCE_RATIO = 0.4
+
 
 def _strip_tags(s: Optional[str]) -> Optional[str]:
     if not s:
@@ -46,6 +58,15 @@ def _strip_tags(s: Optional[str]) -> Optional[str]:
 class CrossrefAdapter(SourceAdapter):
     name = "crossref"
     base = "https://api.crossref.org/works"
+
+    def __init__(
+        self,
+        contact_email: Optional[str] = None,
+        user_agent: str = "slr-engine/1.0 (research; OA only)",
+        min_relevance_ratio: float = _DEFAULT_MIN_RELEVANCE_RATIO,
+    ):
+        super().__init__(contact_email=contact_email, user_agent=user_agent)
+        self.min_relevance_ratio = min_relevance_ratio
 
     def search(
         self,
@@ -87,12 +108,12 @@ class CrossrefAdapter(SourceAdapter):
             headers["User-Agent"] += f" (mailto:{self.contact_email})"
 
         fetched = 0
+        top_score: Optional[float] = None
         while True:
             url = f"{self.base}?{urllib.parse.urlencode(params, doseq=True)}"
             req = urllib.request.Request(url, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read())
+                data = json.loads(self._fetch(req))
             except Exception as e:
                 self._record_error(
                     f"crossref request failed: {type(e).__name__}: {e} "
@@ -106,6 +127,14 @@ class CrossrefAdapter(SourceAdapter):
                 return
 
             for item in items:
+                score = item.get("score")
+                if score is not None:
+                    if top_score is None:
+                        top_score = score
+                    elif top_score > 0 and score < top_score * self.min_relevance_ratio:
+                        # Items come back sorted by score descending; once
+                        # under the floor, the rest of this run only gets worse.
+                        return
                 rec = self._to_record(item)
                 # Crossref's language metadata is unreliable; client-side filter
                 if languages and rec.language and rec.language not in languages:
@@ -138,12 +167,18 @@ class CrossrefAdapter(SourceAdapter):
             engine_filters["until-pub-date"] = date_to
 
         rows = "200"
+        # With cursor paging Crossref does not sort by relevance unless told
+        # to; without this the first page is an arbitrary slice of every
+        # work sharing a word with the query, and the relevance floor in
+        # search() is anchored on a random item's score.
+        by_score = {"sort": "score", "order": "desc"}
         if isinstance(query, str):
             # Legacy: free-text query. Use as `query=`.
             params: dict = {
                 "query": query,
                 "rows": rows,
                 "cursor": "*",
+                **by_score,
             }
             if engine_filters:
                 params["filter"] = ",".join(
@@ -187,6 +222,9 @@ class CrossrefAdapter(SourceAdapter):
             v = query.get(passthrough)
             if v:
                 params[passthrough] = v
+
+        if any(k.startswith("query") for k in params):
+            params.update(by_score)
 
         # Filters (strict - actually exclude non-matching)
         user_filters = query.get("filter") or {}
@@ -256,5 +294,6 @@ class CrossrefAdapter(SourceAdapter):
             document_type=item.get("type"),
             language=item.get("language"),
             url=item.get("URL"),
+            native_relevance_score=item.get("score"),
             raw=item,
         )

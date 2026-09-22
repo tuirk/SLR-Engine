@@ -109,17 +109,13 @@ def _merge(conn: sqlite3.Connection, *, keep_id: int, drop_id: int,
         (drop_id,)
     ).fetchall()
     for h in hits:
-        conflict = conn.execute(
-            "SELECT id FROM source_hits WHERE source = ? AND source_id = ?",
-            (h["source"], h["source_id"])
-        ).fetchone()
-        if conflict:
-            conn.execute("DELETE FROM source_hits WHERE id = ?", (h["id"],))
-        else:
-            conn.execute(
-                "UPDATE source_hits SET record_id = ? WHERE id = ?",
-                (keep_id, h["id"])
-            )
+        # (source, source_id) is UNIQUE, so the hit can always move. Keeping it
+        # preserves provenance (e.g. the arXiv id stage 05 resolves PDFs from)
+        # and the per-database counts PRISMA reports as identified.
+        conn.execute(
+            "UPDATE source_hits SET record_id = ? WHERE id = ?",
+            (keep_id, h["id"])
+        )
         conn.execute(
             "INSERT INTO dedup_log "
             "(canonical_id, merged_source, merged_source_id, "

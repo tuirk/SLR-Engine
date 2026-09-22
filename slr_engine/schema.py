@@ -23,9 +23,11 @@ CREATE TABLE IF NOT EXISTS records (
     from_seed       INTEGER NOT NULL DEFAULT 0,
     tldr            TEXT,
     snowball_rank   INTEGER,
-    oa_status       TEXT,                   -- gold, green, hybrid, bronze, closed, unknown
+    oa_status       TEXT,                   -- gold, diamond, hybrid, green, bronze, closed, unknown
     oa_url          TEXT,
     license         TEXT,
+    native_relevance_score REAL,            -- source's own ranking score (raw scale, NOT comparable across sources); used only for early-stop pagination
+    relevance_score REAL,                   -- local sentence-embedding cosine similarity vs. seed reference (0..1, comparable across all sources)
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -100,7 +102,7 @@ CREATE TABLE IF NOT EXISTS downloads (
     url             TEXT NOT NULL,
     license         TEXT,
     file_path       TEXT,                   -- relative path under data/fulltext/
-    file_format     TEXT,                   -- pdf, xml, html
+    file_format     TEXT,                   -- pdf, xml, html, text (as detected once downloaded)
     status          TEXT NOT NULL,          -- resolved, queued, success, failed, skipped_closed, skipped_superseded
     error           TEXT,
     fetched_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

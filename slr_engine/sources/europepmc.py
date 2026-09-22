@@ -48,8 +48,7 @@ class EuropePMCAdapter(SourceAdapter):
             url = f"{self.base}?{urllib.parse.urlencode(params)}"
             req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read())
+                data = json.loads(self._fetch(req))
             except Exception as e:
                 self._record_error(
                     f"europe_pmc request failed: {type(e).__name__}: {e} "

@@ -292,9 +292,42 @@ def validate_arxiv(query: str) -> ValidationResult:
 
 
 def validate_semantic_scholar(query: str) -> ValidationResult:
-    """Semantic Scholar accepts free text but benefits from OpenAlex-style grouping."""
-    r = validate_openalex(query)
-    r.source = "semantic_scholar"
+    """Semantic Scholar /paper/search rules.
+
+    The endpoint is plain-text relevance search with no query syntax:
+    AND/OR/NOT are matched as ordinary words, quotes and parentheses are
+    ignored, and hyphenated terms match nothing (the API docs say to write
+    them with spaces). OpenAlex-style Boolean groups therefore return noise
+    or zero results.
+    """
+    r = ValidationResult(source="semantic_scholar")
+    if not query or not query.strip():
+        r.errors.append("query is empty")
+        return r
+
+    if _BOOL_OPS_RE.search(query):
+        r.errors.append(
+            "Boolean operators (AND/OR/NOT) are not supported: Semantic "
+            "Scholar's relevance search matches them as ordinary words. Use "
+            "a short plain-text phrase such as the review's core term."
+        )
+    hyphenated = sorted(set(re.findall(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", query)))
+    if hyphenated:
+        r.errors.append(
+            "hyphenated terms match nothing on Semantic Scholar; write them "
+            f"with spaces: {', '.join(hyphenated[:5])}"
+        )
+    if re.search(r'["()]', query):
+        r.warnings.append(
+            "quotes and parentheses are ignored by Semantic Scholar's "
+            "relevance search"
+        )
+    n_tokens = _count_meaningful_tokens(query)
+    if n_tokens > 8:
+        r.warnings.append(
+            f"{n_tokens} terms: long plain-text queries drift in relevance "
+            "ranking. Keep to a few distinctive words."
+        )
     return r
 
 

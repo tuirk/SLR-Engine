@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Iterator, Optional
@@ -12,6 +13,26 @@ from ..env import load_dotenv
 
 
 load_dotenv()
+
+
+def _friendly_error(e: Exception, api_key_set: bool) -> str:
+    """Semantic Scholar's unauthenticated tier shares a GLOBAL pool (5000
+    req/5min across every unauthenticated caller, not just this project),
+    and /paper/search is capped at 1 req/sec even with a key. A 429 here
+    often means the shared pool was already exhausted by other traffic --
+    exponential backoff helps but can't guarantee success without a private
+    quota. Point at the actual fix rather than just reporting the failure.
+    """
+    msg = f"{type(e).__name__}: {e}"
+    if isinstance(e, urllib.error.HTTPError) and e.code == 429 and not api_key_set:
+        msg += (
+            " -- unauthenticated Semantic Scholar requests share a global "
+            "rate pool; a free S2_API_KEY (request at "
+            "https://www.semanticscholar.org/product/api#api-key-form) "
+            "gives a private, more reliable quota instead of competing for "
+            "the shared one. Set S2_API_KEY in .env."
+        )
+    return msg
 
 
 FIELDS = ",".join([
@@ -35,6 +56,16 @@ class SemanticScholarAdapter(SourceAdapter):
         if self.api_key:
             headers["x-api-key"] = self.api_key
         return headers
+
+    def _fetch_json(self, url: str, max_retries: int = 5) -> dict:
+        """GET url as JSON, retrying rate limits and transient failures.
+
+        S2's unauthenticated tier rate-limits aggressively; a single 429 used
+        to abort the whole search, so this allows one more retry than the
+        other adapters (2s, 4s, 8s, 16s, 32s).
+        """
+        req = urllib.request.Request(url, headers=self._headers())
+        return json.loads(self._fetch(req, max_retries=max_retries))
 
     def search(
         self,
@@ -64,13 +95,11 @@ class SemanticScholarAdapter(SourceAdapter):
                 params["year"] = year_filter
             url = f"{self.base}/search?{urllib.parse.urlencode(params)}"
             try:
-                req = urllib.request.Request(url, headers=self._headers())
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read())
+                data = self._fetch_json(url)
             except Exception as e:
                 self._record_error(
-                    f"semantic_scholar request failed: {type(e).__name__}: {e} "
-                    f"(url={url[:200]})"
+                    f"semantic_scholar request failed: "
+                    f"{_friendly_error(e, bool(self.api_key))} (url={url[:200]})"
                 )
                 return
 
@@ -103,12 +132,11 @@ class SemanticScholarAdapter(SourceAdapter):
             params = {"fields": fields, "offset": str(offset), "limit": str(n)}
             url = f"{self.base}/{paper_id}/{direction}?{urllib.parse.urlencode(params)}"
             try:
-                req = urllib.request.Request(url, headers=self._headers())
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read())
+                data = self._fetch_json(url)
             except Exception as e:
                 self._record_error(
-                    f"semantic_scholar {direction} failed: {type(e).__name__}: {e}"
+                    f"semantic_scholar {direction} failed: "
+                    f"{_friendly_error(e, bool(self.api_key))}"
                 )
                 return out
             rows = data.get("data") or []
@@ -124,11 +152,11 @@ class SemanticScholarAdapter(SourceAdapter):
     def lookup_by_doi(self, doi: str) -> Optional[dict]:
         url = f"{self.base}/DOI:{urllib.parse.quote(doi)}?fields=paperId,externalIds"
         try:
-            req = urllib.request.Request(url, headers=self._headers())
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
+            return self._fetch_json(url)
         except Exception as e:
-            self._record_error(f"semantic_scholar DOI lookup failed: {type(e).__name__}: {e}")
+            self._record_error(
+                f"semantic_scholar DOI lookup failed: {_friendly_error(e, bool(self.api_key))}"
+            )
             return None
 
     def _to_record(self, p: dict) -> NormalizedRecord:

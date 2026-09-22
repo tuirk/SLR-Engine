@@ -24,6 +24,19 @@ def main():
     ap.add_argument("--batch-size", type=int, default=5)
     ap.add_argument("--pass-name", default="title_abstract")
     ap.add_argument(
+        "--sort",
+        choices=["default", "relevance_asc", "relevance_desc"],
+        default="default",
+        help=(
+            "default: snowball_rank-based ordering (existing behavior). "
+            "relevance_asc: weakest local-embedding relevance_score first "
+            "(useful for bulk-rejecting the long tail quickly). "
+            "relevance_desc: strongest matches first. Records with no "
+            "relevance_score sort last either way. Triage aid only -- "
+            "every record still gets a real screening decision."
+        ),
+    )
+    ap.add_argument(
         "--projects-root",
         default=str(Path(__file__).resolve().parents[1] / "projects"),
     )
@@ -38,16 +51,22 @@ def main():
     paths = ProjectPaths(project_dir)
     paths.ensure()
 
+    order_by = {
+        "default": "(r.snowball_rank IS NULL), r.snowball_rank DESC, r.id",
+        "relevance_asc": "(r.relevance_score IS NULL), r.relevance_score ASC, r.id",
+        "relevance_desc": "(r.relevance_score IS NULL), r.relevance_score DESC, r.id",
+    }[args.sort]
+
     with connect(paths.db) as conn:
         seed_clause = "AND COALESCE(r.from_seed, 0) = 0 " if args.pass_name == "title_abstract" else ""
         rows = conn.execute(
             "SELECT r.id, r.canonical_id, r.title, r.tldr, r.abstract, r.year, "
-            "r.first_author, r.venue, r.doi, r.snowball_rank "
+            "r.first_author, r.venue, r.doi, r.snowball_rank, r.relevance_score "
             "FROM records r "
             "LEFT JOIN screening s ON s.record_id = r.id AND s.pass = ? AND s.decided_by = 'agent' "
             "WHERE s.id IS NULL "
             f"{seed_clause}"
-            "ORDER BY (r.snowball_rank IS NULL), r.snowball_rank DESC, r.id LIMIT ?",
+            f"ORDER BY {order_by} LIMIT ?",
             (args.pass_name, args.batch_size)
         ).fetchall()
 
@@ -101,6 +120,7 @@ def main():
                 "venue": r["venue"],
                 "doi": r["doi"],
                 "snowball_rank": r["snowball_rank"],
+                "relevance_score": r["relevance_score"],
                 "batch_id": batch_id,
                 # To be filled in by the agent:
                 "decision": None,

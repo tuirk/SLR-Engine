@@ -1,5 +1,7 @@
 # Required
 PyYAML>=6.0
+# arXiv search (stage 02): export.arxiv.org rejects plain urllib requests.
+requests>=2.31
 
 # Optional — for full-text PDF extraction in stage 07 and seed PDFs at scoping time.
 markitdown>=0.0.1
