@@ -158,16 +158,16 @@ You can stop at any point. State is saved to disk between stages (`project.yaml`
 
 ### Stage 05 — Resolve open access
 
-- **Engine:** for T/A `include` records, ranks OA candidates: **PMC → Europe PMC → OpenAlex → Unpaywall → arXiv → CORE (if enabled) → Crossref**. Only gold/green/bronze tiers; hybrid/closed skipped.
+- **Engine:** for T/A `include` records, ranks OA candidates: **PMC → Europe PMC → OpenAlex → Unpaywall → arXiv → CORE (if enabled) → Crossref**. Open-access tiers only (gold, diamond, hybrid, green, bronze); closed works are skipped.
 - **Output:** `oa_url`, `oa_status`, `license` on `records`; download rows in `downloads` table (`resolved` / `queued`).
 
 ---
 
 ### Stage 06 — Download
 
-- **Engine:** fetches OA files to `projects/<id>/data/fulltext/` (PDF/HTML/XML). Retries alternates from the resolve queue.
+- **Engine:** fetches OA files to `projects/<id>/data/fulltext/` (PDF/HTML/XML). Retries alternates from the resolve queue. A file counts only if it is the article itself: bot or JavaScript challenge pages, empty app shells, landing pages and metadata-only XML are recorded as failures with the reason. `--revalidate` re-checks files downloaded by an older version.
 - **You:** can drop manually acquired PDFs into `data/fulltext/` for the next stage.
-- **Output:** files under `data/fulltext/`; paywalled includes listed in `screening/not_downloaded.csv` and `screening/not_downloaded.txt`.
+- **Output:** files under `data/fulltext/`; includes without a downloaded full text are listed in `screening/not_downloaded.csv` and `.txt` with the reason and a suggested next step: `open_access_manual` (open access, but the publisher blocks scripts: use the `oa_url` in a browser), `check_preprint`, `ILL`, or `author_request`.
 
 ---
 

@@ -34,3 +34,6 @@ Thumbs.db
 
 # GitNexus local index
 .gitnexus/
+
+# Local agent settings
+.claude/settings.local.json

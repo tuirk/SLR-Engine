@@ -69,6 +69,18 @@ def _phase_label(x: int, y: int, w: int, label: str) -> str:
     )
 
 
+def _included_lines(ft: dict, ta_included: int, awaiting: int) -> list[str]:
+    """Final box text. Before full-text screening there is no final count yet."""
+    if not sum(ft.values()) and ta_included:
+        return ["Studies included in review",
+                "pending: full-text screening not run",
+                f"({ta_included} included at title/abstract)"]
+    lines = ["Studies included in review", f"n = {ft.get('include', 0)}"]
+    if awaiting:
+        lines.append(f"({awaiting} reports still awaiting full-text screening)")
+    return lines
+
+
 # ---------- canonical PRISMA 2020 ----------
 
 def render_canonical(cfg: ProjectConfig, flow: dict) -> str:
@@ -76,32 +88,30 @@ def render_canonical(cfg: ProjectConfig, flow: dict) -> str:
     W = 880
     H = 760
 
-    # Per-source identification text
+    # Per-source identification text. Scopus and Web of Science are databases
+    # even when their results were exported by hand; seed papers the user
+    # supplied are not a database search.
+    per_source = flow.get("per_source") or {}
     id_lines = ["Records identified from databases:"]
-    for src, n in (flow.get("per_source") or {}).items():
-        if src in ("scopus", "web_of_science"):
+    for src, n in per_source.items():
+        if src == "seed":
             continue
-        id_lines.append(f"  {src}: n = {n}")
+        manual = " (manual export)" if src in ("scopus", "web_of_science") else ""
+        id_lines.append(f"  {src}{manual}: n = {n}")
 
     # Other-sources column
     other_lines = ["Records identified from other sources:"]
+    if per_source.get("seed"):
+        other_lines.append(f"  seed papers (user-supplied): n = {per_source['seed']}")
     snow = flow.get("snowball_by_direction") or {}
     if snow:
         for direction, n in snow.items():
             other_lines.append(f"  snowball ({direction}): n = {n}")
-    for manual_src in ("scopus", "web_of_science"):
-        if (flow.get("per_source") or {}).get(manual_src):
-            other_lines.append(
-                f"  {manual_src} (manual): n = {flow['per_source'][manual_src]}"
-            )
     if len(other_lines) == 1:
         other_lines.append("  (none)")
 
-    total_id = sum((flow.get("per_source") or {}).values()) + \
-               sum((flow.get("snowball_by_direction") or {}).values())
-
     after_dedup = flow.get("records_total", 0)
-    dedup_removed = flow.get("dedup_merges", 0)
+    dedup_removed = flow.get("duplicates_removed", flow.get("dedup_merges", 0))
 
     ta = flow.get("ta_decisions") or {}
     ta_total = sum(ta.values())
@@ -120,8 +130,13 @@ def render_canonical(cfg: ProjectConfig, flow: dict) -> str:
 
     ft = flow.get("ft_decisions") or {}
     ft_excluded = ft.get("exclude", 0)
-    ft_included = ft.get("include", 0)
     ft_unsure = ft.get("unsure", 0)
+    ft_screened = sum(ft.values())
+    awaiting = max(dl_success - ft_screened, 0)
+
+    assessed_lines = ["Reports assessed for eligibility", f"n = {ft_screened}"]
+    if awaiting:
+        assessed_lines.append(f"(awaiting full-text: {awaiting})")
 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
@@ -187,11 +202,7 @@ def render_canonical(cfg: ProjectConfig, flow: dict) -> str:
     parts.append(_arrow(390, 380, 390, 420))
     parts.append(_arrow(500, 450, 560, 450))
 
-    parts.append(
-        _box(280, 510, 220, 60,
-             ["Reports assessed for eligibility", f"n = {dl_success}"],
-             fill="#eef4ff")
-    )
+    parts.append(_box(280, 510, 220, 60, assessed_lines, fill="#eef4ff"))
     parts.append(
         _box(560, 510, 220, 60,
              ["Reports excluded (full-text)",
@@ -204,8 +215,7 @@ def render_canonical(cfg: ProjectConfig, flow: dict) -> str:
 
     # Included
     parts.append(
-        _box(280, 640, 320, 70,
-             ["Studies included in review", f"n = {ft_included}"],
+        _box(280, 640, 320, 70, _included_lines(ft, ta_included, awaiting),
              fill="#dff5e1")
     )
     parts.append(_arrow(390, 570, 410, 640))
@@ -238,7 +248,7 @@ def render_expanded(cfg: ProjectConfig, flow: dict) -> str:
 
     # Reuse canonical for the middle of the flow, with small offsets
     after_dedup = flow.get("records_total", 0)
-    dedup_removed = flow.get("dedup_merges", 0)
+    dedup_removed = flow.get("duplicates_removed", flow.get("dedup_merges", 0))
     ta = flow.get("ta_decisions") or {}
     ta_total = sum(ta.values())
     ta_excluded = ta.get("exclude", 0)
@@ -255,6 +265,8 @@ def render_expanded(cfg: ProjectConfig, flow: dict) -> str:
     ft = flow.get("ft_decisions") or {}
     ft_excluded = ft.get("exclude", 0)
     ft_included = ft.get("include", 0)
+    ft_screened = sum(ft.values())
+    awaiting = max(dl_success - ft_screened, 0)
 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
@@ -287,10 +299,13 @@ def render_expanded(cfg: ProjectConfig, flow: dict) -> str:
     parts.append(_arrow(520, 210, 520, 230))
 
     # Search strategy
-    n_queries = sum(1 for _ in (flow.get("per_source") or {}))  # source count proxy
+    per_source = flow.get("per_source") or {}
+    n_sources = flow.get(
+        "sources_searched", sum(1 for s in per_source if s != "seed")
+    )
     parts.append(
         _box(140, 240, 760, 80,
-             [f"Search executed against {n_queries} sources",
+             [f"Search executed against {n_sources} sources",
               f"Total source-hits: {flow.get('source_hits_total', 0)}"],
              fill="#e3effe")
     )
@@ -298,15 +313,16 @@ def render_expanded(cfg: ProjectConfig, flow: dict) -> str:
 
     # Identification — collapsed
     id_lines = ["Records identified"]
-    for src, n in (flow.get("per_source") or {}).items():
-        id_lines.append(f"{src}: {n}")
+    for src, n in per_source.items():
+        label = "seed papers (user-supplied)" if src == "seed" else src
+        id_lines.append(f"{label}: {n}")
     parts.append(
         _box(140, 370, 470, 100, id_lines, fill="#eef4ff")
     )
     parts.append(
         _box(640, 370, 260, 100,
              [f"After deduplication", f"n = {after_dedup}",
-              f"(merged {dedup_removed})"],
+              f"(removed {dedup_removed} duplicates)"],
              fill="#fff8d6")
     )
     parts.append(_arrow(610, 420, 640, 420))
@@ -336,7 +352,8 @@ def render_expanded(cfg: ProjectConfig, flow: dict) -> str:
     )
     parts.append(
         _box(140, 690, 470, 70,
-             [f"Full-text screened",
+             [f"Full-text screened: {ft_screened}"
+              + (f" (awaiting: {awaiting})" if awaiting else ""),
               f"included: {ft_included} | excluded: {ft_excluded}"],
              fill="#eef4ff")
     )
@@ -357,8 +374,7 @@ def render_expanded(cfg: ProjectConfig, flow: dict) -> str:
 
     # Included
     parts.append(
-        _box(140, 810, 760, 80,
-             [f"Studies included in review", f"n = {ft_included}"],
+        _box(140, 810, 760, 80, _included_lines(ft, ta_included, awaiting),
              fill="#dff5e1")
     )
     parts.append(_arrow(520, 890, 520, 920))

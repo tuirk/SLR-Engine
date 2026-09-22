@@ -128,15 +128,15 @@ The last column marks who runs each step: **script** (Python only), **agent** (c
 | 00c | extract vocab | KeyBERT (optional) + agent curation → `seeds/_vocabulary.json`; canonical terms for queries and PICOC—avoid inventing search vocabulary from general knowledge | script + agent |
 | 01 | query gen | Scaffold `queries/` templates; agent fills literals from `project.yaml` + vocabulary; you approve strings before **02**. **Keyword search** path after **00c** | agent |
 | 01a | protocol draft (optional) | Emit prospective `protocol_draft.md` before search | agent + user |
-| 02 | search (open) | Run approved queries on enabled APIs (OpenAlex, Crossref, arXiv, Semantic Scholar default; PubMed, Europe PMC, DBLP, IA Scholar optional). Pre-flight query validation; post-search sanity (silent zeros, cap hits). Records + `source_hits` + frozen `queries` in DB; `logs/search.log` | script |
+| 02 | search (open) | Run approved queries on enabled APIs (OpenAlex, Crossref, arXiv, Semantic Scholar default; PubMed, Europe PMC, DBLP, IA Scholar optional). Pre-flight query validation; post-search sanity (silent zeros, cap hits). Records + `source_hits` + frozen `queries` in DB; `logs/search.log`. Sources with a native ranking score (OpenAlex, Crossref) stop paginating past a relevance floor, since neither supports true boolean/phrase queries — Crossref in particular is pure bag-of-words relevance ranking with no minimum score, quotes and `OR` are inert. A free local sentence-embedding score (`records.relevance_score`, vs. seed papers, comparable across every source) is computed automatically at the end of the run | script |
 | 02b | ingest manual (optional) | Scopus / WoS / Google Scholar RIS or CSV from `imports/`—use partial paid access alongside free APIs | script |
 | 03 | dedup | DOI / PMID / OpenAlex exact match, then fuzzy title+author+year; `dedup_log`. Blocks on unacknowledged search issues; blocks re-dedup after screening unless `--force` | script |
-| 04 | screen prep | Export unscreened records to `screening/batch_*.jsonl` (≤5 per batch) + `criteria.md` | script |
+| 04 | screen prep | Export unscreened records to `screening/batch_*.jsonl` (≤5 per batch) + `criteria.md`. `--sort relevance_asc\|relevance_desc` orders batches by `relevance_score` (triage aid — every record still gets a real decision, nothing is auto-filtered) | script |
 | 04b | T/A screen commit | Label batches (`decision`, `reason`, `criteria_hit`); commit with provenance (`agent`, `human`, `seed`, …) | agent |
 | 04c | T/A screen LLM (optional) | Unattended LLM or agent handoff packets (`*_prompts.jsonl`) | script / agent |
-| 05 | resolve OA | PMC → Europe PMC → OpenAlex → Unpaywall → CORE (optional) → Crossref; gold/green/bronze only | script |
+| 05 | resolve OA | PMC → Europe PMC → OpenAlex → Unpaywall → CORE (optional) → Crossref; open-access copies only (closed works skipped) | script |
 | 06 | download | Fetch OA full text to `data/fulltext/` | script |
-| 07 | full-text prep | PDF/HTML/XML → `data/fulltext_md/`; intro/conclusion excerpts for triage; `not_downloaded.csv`/`.txt` for paywalled includes | script |
+| 07 | full-text prep | PDF/HTML/XML → `data/fulltext_md/`; intro/conclusion excerpts for triage; `not_downloaded.csv`/`.txt` for includes without a downloaded full text, with a suggested next step | script |
 | 07b | full-text commit | Commit hand labels on full-text batches | agent |
 | 07c | LLM full-text + extract (optional) | Screen + structured extraction on paper text; `--with-quality` adds PRISMA-oriented risk-of-bias fields | script + agent |
 | 07d | human review | Review LLM recommendations; user overrides; final commit | user (final), agent (assistant) |

@@ -426,6 +426,12 @@ python scripts/06_download.py --project <slug>
 python scripts/07_fulltext_prep.py --project <slug>
 ```
 
+`06_download.py` counts a download only when the file is real full text. Bot or
+JavaScript challenge pages, empty app shells and metadata-only XML are recorded
+as failures (with the reason) and listed in `screening/not_downloaded.csv`.
+On a project downloaded with an older SLR-Engine, run it once with
+`--revalidate` to re-check the files already marked as downloaded.
+
 For full-text, the LLM path is the default for >20 records. For academic
 systematic reviews, do not skip PRISMA risk-of-bias assessment unless the user
 explicitly accepts incomplete PRISMA reporting:

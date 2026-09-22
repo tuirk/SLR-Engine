@@ -13,6 +13,7 @@ Usage:
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -99,7 +100,21 @@ def main():
                    GROUP_CONCAT(DISTINCT sh.source) AS sources,
                    r.id AS _rid
             FROM records r
-            LEFT JOIN downloads d ON d.record_id = r.id
+            -- One row per record: the success if there is one, otherwise the
+            -- same row not_downloaded.csv reports.
+            LEFT JOIN downloads d ON d.id = (
+                SELECT d2.id FROM downloads d2
+                WHERE d2.record_id = r.id
+                ORDER BY CASE d2.status
+                           WHEN 'success' THEN 0
+                           WHEN 'failed' THEN 1
+                           WHEN 'skipped_closed' THEN 2
+                           WHEN 'resolved' THEN 3
+                           WHEN 'queued' THEN 4
+                           ELSE 5 END,
+                         d2.id DESC
+                LIMIT 1
+            )
             LEFT JOIN source_hits sh ON sh.record_id = r.id
             GROUP BY r.id
             ORDER BY r.id
@@ -297,9 +312,41 @@ def main():
     print("Total records:   ", len(rows))
 
 
+_RIS_TYPES = {
+    "journal-article": "JOUR", "article": "JOUR", "journalarticle": "JOUR",
+    "review": "JOUR", "editorial": "JOUR", "letter": "JOUR",
+    "conference-paper": "CPAPER", "proceedings-article": "CPAPER",
+    "conference": "CPAPER", "conference-abstract": "CPAPER",
+    "preprint": "UNPB", "posted-content": "UNPB",
+    "book-chapter": "CHAP", "book": "BOOK", "monograph": "BOOK",
+    "dissertation": "THES", "thesis": "THES",
+    "report": "RPRT", "dataset": "DATA",
+}
+_CONFERENCE_VENUE = re.compile(
+    r"conference|proceedings|workshop|symposium|congress|\bCHI\b|\bICSE\b", re.I
+)
+_PREPRINT_VENUE = re.compile(r"arxiv|ssrn|research square|techrxiv|preprint", re.I)
+
+
+def _ris_type(document_type, venue) -> str:
+    """RIS item type from the source's document type, checked against the venue.
+
+    Semantic Scholar labels many conference papers "JournalArticle" or "Book",
+    so a conference-looking venue overrides those labels.
+    """
+    ris = _RIS_TYPES.get((document_type or "").lower().replace(" ", ""))
+    venue = venue or ""
+    if ris in (None, "JOUR", "BOOK") and _CONFERENCE_VENUE.search(venue):
+        return "CPAPER"
+    if ris is None:
+        return "UNPB" if _PREPRINT_VENUE.search(venue) else "JOUR"
+    return ris
+
+
 def _to_ris(r) -> str:
     """Minimal RIS for an included record."""
-    lines = ["TY  - JOUR"]
+    ris_type = _ris_type(r["document_type"], r["venue"])
+    lines = [f"TY  - {ris_type}"]
     if r["title"]:
         lines.append(f"TI  - {r['title']}")
     if r["authors_json"]:
@@ -313,7 +360,8 @@ def _to_ris(r) -> str:
     if r["year"]:
         lines.append(f"PY  - {r['year']}")
     if r["venue"]:
-        lines.append(f"JO  - {r['venue']}")
+        # Journal name for articles; proceedings, book or repository otherwise.
+        lines.append(f"{'JO' if ris_type == 'JOUR' else 'T2'}  - {r['venue']}")
     if r["doi"]:
         lines.append(f"DO  - {r['doi']}")
     if r["url"]:

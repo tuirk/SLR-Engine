@@ -475,7 +475,24 @@ def _query_summary(conn: sqlite3.Connection) -> list[dict]:
         "SELECT query_id, source, query_string, executed_at, result_count, notes "
         "FROM queries ORDER BY executed_at"
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    # Searches run before request failures were stored with the query only
+    # have them in the event log (silent-zero / partial-coverage events).
+    problems: dict[str, str] = {}
+    for e in conn.execute(
+        "SELECT message, payload_json FROM events "
+        "WHERE stage = 'search' AND level IN ('error', 'warning') ORDER BY id"
+    ).fetchall():
+        try:
+            query_id = json.loads(e["payload_json"] or "{}").get("query_id")
+        except (ValueError, AttributeError):
+            continue
+        if query_id:
+            problems.setdefault(query_id, e["message"])
+    for q in out:
+        if not q.get("notes") and q["query_id"] in problems:
+            q["notes"] = problems[q["query_id"]]
+    return out
 
 
 def _decision_counts(conn: sqlite3.Connection, pass_name: str) -> dict:
@@ -531,20 +548,36 @@ def _flow_counts(conn: sqlite3.Connection) -> dict:
     out["records_total"] = conn.execute(
         "SELECT COUNT(*) AS n FROM records"
     ).fetchone()["n"]
-    out["source_hits_total"] = conn.execute(
-        "SELECT COUNT(*) AS n FROM source_hits"
-    ).fetchone()["n"]
 
+    # Records identified per source. Fuzzy dedup used to delete the hits it
+    # merged, so in older projects those hits survive only in dedup_log.
     out["per_source"] = {}
     for r in conn.execute(
-        "SELECT source, COUNT(DISTINCT source_id) AS n "
-        "FROM source_hits GROUP BY source"
+        """
+        SELECT source, COUNT(*) AS n FROM (
+            SELECT source, COALESCE(source_id, 'hit:' || id) AS sid
+            FROM source_hits
+            UNION
+            SELECT merged_source, merged_source_id FROM dedup_log
+            WHERE merged_source_id IS NOT NULL
+        )
+        GROUP BY source
+        """
     ).fetchall():
         out["per_source"][r["source"]] = r["n"]
+    out["source_hits_total"] = sum(out["per_source"].values())
+
+    out["sources_searched"] = conn.execute(
+        "SELECT COUNT(DISTINCT source) AS n FROM queries"
+    ).fetchone()["n"]
 
     out["dedup_merges"] = conn.execute(
         "SELECT COUNT(*) AS n FROM dedup_log"
     ).fetchone()["n"]
+    # Exact-id matches at insert time and fuzzy merges together.
+    out["duplicates_removed"] = max(
+        out["source_hits_total"] - out["records_total"], 0
+    )
 
     out["snowball_links"] = conn.execute(
         "SELECT COUNT(*) AS n FROM snowball_links"
@@ -608,6 +641,8 @@ def _format_search_strategy(queries: list[dict]) -> str:
         count = q.get("result_count", 0)
         query_string = str(q.get("query_string", ""))[:1000]
         out.append(f"**{source}** (executed {when}, returned {count} records)")
+        if q.get("notes"):
+            out.append(f"> Note: {q['notes']}")
         out.append(f"```\n{query_string}\n```")
     return "\n".join(out) + "\n"
 
@@ -616,12 +651,13 @@ def _format_flow_summary(flow: dict) -> str:
     lines = ["**Identification:**"]
     if flow["per_source"]:
         for source, count in flow["per_source"].items():
-            lines.append(f"- {source}: {count} records")
+            label = "seed papers (user-supplied)" if source == "seed" else source
+            lines.append(f"- {label}: {count} records")
     lines.append(f"- Total source-hits: {flow['source_hits_total']}")
     lines.append("")
     lines.append(
         f"**After deduplication:** {flow['records_total']} unique records "
-        f"(merged {flow['dedup_merges']} duplicates)"
+        f"(removed {flow.get('duplicates_removed', flow['dedup_merges'])} duplicates)"
     )
     lines.append("")
     if flow["ta_decisions"]:
