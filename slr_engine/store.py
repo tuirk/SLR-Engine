@@ -83,6 +83,14 @@ class ProjectConfig:
             cfg.topic = cfg.question
         elif cfg.topic and not cfg.question:
             cfg.question = cfg.topic
+        # YAML auto-parses unquoted ISO dates (2021-01-01) into datetime.date.
+        # The field contract is str, and source adapters do string ops on it
+        # (.replace/.split/slicing), so coerce back to ISO strings here.
+        for _attr in ("date_from", "date_to"):
+            _val = getattr(cfg, _attr)
+            if _val is not None and not isinstance(_val, str):
+                setattr(cfg, _attr, _val.isoformat()
+                        if hasattr(_val, "isoformat") else str(_val))
         return cfg
 
     def save(self, project_dir: Path) -> None:
